@@ -3,6 +3,17 @@ import streamlit as st
 from models import used_port_ids, port_label, circuits_for_port
 
 
+def normalize_cable_id_list(value):
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if value is None or pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    return [x.strip() for x in text.replace("[", "").replace("]", "").replace("'", "").split(",") if x.strip()]
+
+
 def role_icon(role):
     role = str(role).lower()
     if "fiber" in role:
@@ -116,9 +127,7 @@ def show_circuit_path(circuit_id):
     c = match.iloc[0]
     st.markdown(f"### Circuit Path — {c['circuit_id']}")
     st.markdown(f"**Customer:** {c.get('customer','')}  ")
-    ids = c.get("cable_ids", [])
-    if not isinstance(ids, list):
-        ids = [x.strip() for x in str(ids).replace("[", "").replace("]", "").replace("'", "").split(",") if x.strip()]
+    ids = normalize_cable_id_list(c.get("cable_ids", []))
     if not ids:
         st.warning("This circuit has no cable segments assigned.")
         return

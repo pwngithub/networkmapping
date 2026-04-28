@@ -239,9 +239,48 @@ def get_or_create_site_device(site_id, name, role, rack_room, rack_suffix, posit
 def ensure_site_columns():
     for df_name in ["tap_records", "circuits", "cables"]:
         if df_name in st.session_state:
-            for col in ["site_id", "site_name"]:
+            for col in ["site_id", "site_name", "project", "location"]:
                 if col not in st.session_state[df_name].columns:
                     st.session_state[df_name][col] = ""
+    if "change_log" not in st.session_state:
+        st.session_state.change_log = pd.DataFrame(columns=[
+            "timestamp", "event_type", "entity", "entity_id", "details",
+        ])
+
+
+def log_event(event_type, entity, entity_id, details):
+    row = pd.DataFrame([{
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+        "event_type": event_type,
+        "entity": entity,
+        "entity_id": str(entity_id),
+        "details": str(details),
+    }])
+    st.session_state.change_log = pd.concat([st.session_state.change_log, row], ignore_index=True)
+
+
+def endpoint_label(endpoint_type, port_id, description):
+    if endpoint_type == "device_port":
+        return port_label(port_id)
+    return str(description).strip() if str(description).strip() else "External / Unknown"
+
+
+def normalize_cable_id_list(value):
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if value is None or pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            out = ast.literal_eval(text)
+            if isinstance(out, list):
+                return [str(x).strip() for x in out if str(x).strip()]
+        except Exception:
+            pass
+    return [x.strip() for x in text.replace(";", ",").split(",") if x.strip()]
 
 
 ensure_site_columns()
@@ -253,6 +292,19 @@ if page == "🏠 Dashboard":
     col3.metric("Equipment", len(st.session_state.devices))
     col4.metric("Cables", len(st.session_state.cables))
     col5.metric("Circuits", len(st.session_state.circuits))
+    if not st.session_state.cables.empty:
+        with st.container(border=True):
+            st.subheader("Cable Inventory Summary")
+            subtype_counts = st.session_state.cables["subtype"].fillna("unknown").astype(str).value_counts().reset_index()
+            subtype_counts.columns = ["subtype", "count"]
+            st.dataframe(subtype_counts, use_container_width=True, hide_index=True)
+    if not st.session_state.change_log.empty:
+        st.subheader("Recent Changes")
+        st.dataframe(
+            st.session_state.change_log.sort_values("timestamp", ascending=False).head(20),
+            use_container_width=True,
+            hide_index=True,
+        )
     if not st.session_state.tap_records.empty:
         st.subheader("TAP Summary")
         c1, c2, c3, c4 = st.columns(4)
@@ -387,72 +439,169 @@ elif page == "🧱 Rack & Equipment View":
             show_circuit_path(selected_circuit)
 
 elif page == "🔌 Build Cable / Circuit":
-    st.header("Build Cable / Circuit From Ports")
-    st.info("Pick A-End and Z-End from equipment port views, then create the physical cable and logical circuit here.")
-    col1, col2 = st.columns(2)
-    col1.write("**A-End:** " + port_label(st.session_state.get("pending_a_port")))
-    col2.write("**Z-End:** " + port_label(st.session_state.get("pending_z_port")))
-    with st.form("build_circuit"):
-        circuit_id = st.text_input("Circuit ID", value=f"CKT-{datetime.now().strftime('%Y%m%d%H%M')}")
-        customer = st.text_input("Customer / Account #")
-        carrier = st.text_input("Carrier", value="Pioneer")
-        ctype = st.selectbox("Circuit Type", ["Customer Fiber / TAP", "DIA", "Transit", "MPLS", "Wavelength", "Point-to-Point", "Cross-Connect"])
-        bandwidth = st.text_input("Bandwidth")
-        cable_id = st.text_input("Physical Cable ID", value=f"CBL-{datetime.now().strftime('%Y%m%d%H%M')}")
-        strand = st.text_input("Fiber / Strand")
-        status = st.selectbox("Status", ["active", "assigned", "pending", "available", "decommissioned"])
-        notes = st.text_area("Notes")
-        submit = st.form_submit_button("Create cable and circuit", type="primary")
-        if submit:
-            a = st.session_state.get("pending_a_port")
-            z = st.session_state.get("pending_z_port")
-            if not a or not z:
-                st.error("Select both A-End and Z-End ports first.")
-            elif a == z:
-                st.error("A-End and Z-End cannot be the same port.")
-            else:
-                if st.session_state.cables[st.session_state.cables["cable_id"] == cable_id].empty:
-                    st.session_state.cables = pd.concat([st.session_state.cables, pd.DataFrame([{
-                        "cable_id": cable_id,
-                        "cable_type": "fiber" if strand else "ethernet",
-                        "color": "yellow" if strand else "blue",
-                        "fiber_count": 1 if strand else None,
-                        "subtype": "mapped_existing_cable",
-                        "a_port_id": int(a),
-                        "z_port_id": int(z),
-                        "a_description": port_label(a),
-                        "z_description": port_label(z),
+    st.header("Build Cable / Circuit")
+    st.info("Track incoming cables, internal patch cables, and stitch them into end-to-end circuits.")
+    tab_cable, tab_circuit = st.tabs(["Create Physical Cable Segment", "Create / Update Logical Circuit"])
+
+    with tab_cable:
+        used = used_port_ids()
+        col1, col2 = st.columns(2)
+        col1.write("**Quick pick A-End from rack view:** " + port_label(st.session_state.get("pending_a_port")))
+        col2.write("**Quick pick Z-End from rack view:** " + port_label(st.session_state.get("pending_z_port")))
+        with st.form("create_cable_segment"):
+            c1, c2, c3 = st.columns(3)
+            cable_id = c1.text_input("Cable ID *", value=f"CBL-{datetime.now().strftime('%Y%m%d%H%M')}")
+            cable_type = c2.selectbox("Cable Type", ["fiber", "ethernet", "coax", "other"])
+            subtype = c3.selectbox("Subtype", ["incoming", "cross_connect", "patch", "backbone", "tap_drop_or_distribution", "mapped_existing_cable"])
+            project = st.text_input("Project / Location Name")
+            c4, c5, c6 = st.columns(3)
+            location = c4.text_input("Physical Area")
+            strand = c5.text_input("Fiber / Pair / Strand")
+            color = c6.text_input("Color", value="yellow" if cable_type == "fiber" else "blue")
+            site_id = st.selectbox("Site", st.session_state.sites["site_id"].tolist(), format_func=lambda sid: get_site_name(sid))
+
+            a_type, z_type = st.columns(2)
+            a_end_type = a_type.radio("A-End Type", ["device_port", "external_handoff"], horizontal=True, key="a_end_type")
+            z_end_type = z_type.radio("Z-End Type", ["device_port", "external_handoff"], horizontal=True, key="z_end_type")
+
+            p1, p2 = st.columns(2)
+            default_a = st.session_state.get("pending_a_port")
+            default_z = st.session_state.get("pending_z_port")
+            a_port = p1.selectbox(
+                "A-End Device Port",
+                [None] + st.session_state.ports["port_id"].astype(int).tolist(),
+                index=([None] + st.session_state.ports["port_id"].astype(int).tolist()).index(default_a) if default_a in st.session_state.ports["port_id"].astype(int).tolist() else 0,
+                format_func=lambda pid: "— select —" if pid is None else port_label(pid),
+                disabled=a_end_type != "device_port",
+            )
+            z_port = p2.selectbox(
+                "Z-End Device Port",
+                [None] + st.session_state.ports["port_id"].astype(int).tolist(),
+                index=([None] + st.session_state.ports["port_id"].astype(int).tolist()).index(default_z) if default_z in st.session_state.ports["port_id"].astype(int).tolist() else 0,
+                format_func=lambda pid: "— select —" if pid is None else port_label(pid),
+                disabled=z_end_type != "device_port",
+            )
+            a_desc = p1.text_input("A-End External Handoff Label", placeholder="MMR Demarc A / Carrier panel 1/1", disabled=a_end_type != "external_handoff")
+            z_desc = p2.text_input("Z-End External Handoff Label", placeholder="OSP Vault / Building Entrance", disabled=z_end_type != "external_handoff")
+            allow_reuse = st.checkbox("Allow a device port already in use", value=False)
+
+            submit_cable = st.form_submit_button("Create Cable Segment", type="primary")
+            if submit_cable:
+                errors = []
+                if not str(cable_id).strip():
+                    errors.append("Cable ID is required.")
+                if not st.session_state.cables[st.session_state.cables["cable_id"].astype(str) == str(cable_id)].empty:
+                    errors.append("Cable ID already exists.")
+                if a_end_type == "device_port" and a_port is None:
+                    errors.append("Pick an A-End device port or switch A-End to external handoff.")
+                if z_end_type == "device_port" and z_port is None:
+                    errors.append("Pick a Z-End device port or switch Z-End to external handoff.")
+                if a_end_type == "external_handoff" and not str(a_desc).strip():
+                    errors.append("Enter A-End external handoff label.")
+                if z_end_type == "external_handoff" and not str(z_desc).strip():
+                    errors.append("Enter Z-End external handoff label.")
+                if a_end_type == "device_port" and z_end_type == "device_port" and int(a_port) == int(z_port):
+                    errors.append("A-End and Z-End cannot be the same port.")
+                if not allow_reuse:
+                    if a_end_type == "device_port" and int(a_port) in used:
+                        errors.append("A-End port already has a cable. Enable 'Allow reuse' to override.")
+                    if z_end_type == "device_port" and int(z_port) in used:
+                        errors.append("Z-End port already has a cable. Enable 'Allow reuse' to override.")
+                if errors:
+                    for e in errors:
+                        st.error(e)
+                else:
+                    row = pd.DataFrame([{
+                        "cable_id": str(cable_id).strip(),
+                        "cable_type": cable_type,
+                        "color": color,
+                        "fiber_count": 1 if cable_type == "fiber" else None,
+                        "subtype": subtype,
+                        "a_port_id": int(a_port) if a_end_type == "device_port" else None,
+                        "z_port_id": int(z_port) if z_end_type == "device_port" else None,
+                        "a_description": endpoint_label(a_end_type, a_port, a_desc),
+                        "z_description": endpoint_label(z_end_type, z_port, z_desc),
                         "length": None,
                         "strand": strand,
-                    }])], ignore_index=True)
-                st.session_state.circuits = pd.concat([st.session_state.circuits, pd.DataFrame([{
-                    "circuit_id": circuit_id,
-                    "carrier": carrier,
-                    "circuit_type": ctype,
-                    "bandwidth": bandwidth,
-                    "status": status,
-                    "a_end": port_label(a),
-                    "z_end": port_label(z),
-                    "cable_ids": [cable_id],
-                    "notes": notes,
-                    "customer": customer,
-                    "tap": "",
-                    "tap_port": "",
-                    "co_fiber": strand,
-                    "street": "",
-                    "pole": "",
-                    "project": "",
-                    "location": "",
-                }])], ignore_index=True)
-                st.success("Cable and circuit created.")
-                st.rerun()
+                        "site_id": int(site_id),
+                        "site_name": get_site_name(site_id),
+                        "project": project.strip(),
+                        "location": location.strip(),
+                    }])
+                    st.session_state.cables = pd.concat([st.session_state.cables, row], ignore_index=True)
+                    log_event("create", "cable", cable_id, f"{subtype} {endpoint_label(a_end_type, a_port, a_desc)} -> {endpoint_label(z_end_type, z_port, z_desc)}")
+                    st.success(f"Cable segment {cable_id} created.")
+                    st.rerun()
+
+    with tab_circuit:
+        with st.form("create_or_update_circuit"):
+            circuit_id = st.text_input("Circuit ID *", value=f"CKT-{datetime.now().strftime('%Y%m%d%H%M')}")
+            customer = st.text_input("Customer / Account #")
+            carrier = st.text_input("Carrier", value="Pioneer")
+            ctype = st.selectbox("Circuit Type", ["Customer Fiber / TAP", "DIA", "Transit", "MPLS", "Wavelength", "Point-to-Point", "Cross-Connect"])
+            bandwidth = st.text_input("Bandwidth")
+            status = st.selectbox("Status", ["active", "assigned", "pending", "available", "decommissioned"])
+            site_id = st.selectbox("Site ", st.session_state.sites["site_id"].tolist(), format_func=lambda sid: get_site_name(sid))
+            project = st.text_input("Project / Location Name ")
+            location = st.text_input("Physical Area ")
+            cable_options = st.session_state.cables["cable_id"].astype(str).tolist()
+            selected_cables = st.multiselect("Cable segments in path order", cable_options)
+            notes = st.text_area("Notes")
+            submit_circuit = st.form_submit_button("Create / Update Circuit", type="primary")
+            if submit_circuit:
+                if not str(circuit_id).strip():
+                    st.error("Circuit ID is required.")
+                elif not selected_cables:
+                    st.error("Select at least one cable segment.")
+                else:
+                    first_cable = st.session_state.cables[st.session_state.cables["cable_id"].astype(str) == str(selected_cables[0])].iloc[0]
+                    last_cable = st.session_state.cables[st.session_state.cables["cable_id"].astype(str) == str(selected_cables[-1])].iloc[0]
+                    row = {
+                        "circuit_id": str(circuit_id).strip(),
+                        "carrier": carrier,
+                        "circuit_type": ctype,
+                        "bandwidth": bandwidth,
+                        "status": status,
+                        "a_end": str(first_cable.get("a_description", "")),
+                        "z_end": str(last_cable.get("z_description", "")),
+                        "cable_ids": selected_cables,
+                        "notes": notes,
+                        "customer": customer,
+                        "tap": "",
+                        "tap_port": "",
+                        "co_fiber": "",
+                        "street": "",
+                        "pole": "",
+                        "project": project.strip(),
+                        "location": location.strip(),
+                        "site_id": int(site_id),
+                        "site_name": get_site_name(site_id),
+                    }
+                    exists = st.session_state.circuits["circuit_id"].astype(str) == str(circuit_id).strip()
+                    if exists.any():
+                        for k, v in row.items():
+                            st.session_state.circuits.loc[exists, k] = [v]
+                        log_event("update", "circuit", circuit_id, f"{len(selected_cables)} cable segments")
+                        st.success(f"Circuit {circuit_id} updated.")
+                    else:
+                        st.session_state.circuits = pd.concat([st.session_state.circuits, pd.DataFrame([row])], ignore_index=True)
+                        log_event("create", "circuit", circuit_id, f"{len(selected_cables)} cable segments")
+                        st.success(f"Circuit {circuit_id} created.")
+                    st.rerun()
 
 elif page == "📋 Cables":
     st.header("Cables")
     df = st.session_state.cables.copy()
+    subtype_values = sorted([x for x in df["subtype"].dropna().astype(str).unique().tolist()]) if not df.empty and "subtype" in df.columns else []
+    selected_subtype = st.selectbox("Subtype", ["All"] + subtype_values)
+    if selected_subtype != "All" and not df.empty:
+        df = df[df["subtype"].astype(str) == selected_subtype]
+    q = st.text_input("Search cables")
+    if q and not df.empty:
+        df = df[df.astype(str).apply(lambda col: col.str.contains(q, case=False, na=False)).any(axis=1)]
     if not df.empty:
-        df["A-End"] = df["a_port_id"].apply(port_label)
-        df["Z-End"] = df["z_port_id"].apply(port_label)
+        df["A-End"] = df.apply(lambda r: port_label(r["a_port_id"]) if pd.notna(r["a_port_id"]) else str(r.get("a_description", "")), axis=1)
+        df["Z-End"] = df.apply(lambda r: port_label(r["z_port_id"]) if pd.notna(r["z_port_id"]) else str(r.get("z_description", "")), axis=1)
     edited = st.data_editor(df, use_container_width=True, num_rows="dynamic")
     st.session_state.cables = edited.drop(columns=[c for c in ["A-End", "Z-End"] if c in edited.columns], errors="ignore")
 
@@ -488,6 +637,7 @@ elif page == "📡 Circuits":
         show_circuit_path(selected)
         if st.button("Delete selected circuit", type="secondary"):
             st.session_state.circuits = st.session_state.circuits[st.session_state.circuits["circuit_id"] != selected].copy()
+            log_event("delete", "circuit", selected, "Circuit removed from inventory")
             st.success("Circuit deleted.")
             st.rerun()
 

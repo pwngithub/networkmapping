@@ -29,7 +29,23 @@ def initialize_data():
     st.session_state.ports = build_ports_from_devices(st.session_state.devices)
 
     st.session_state.cables = pd.DataFrame([
-        {"cable_id": "CBL-001", "cable_type": "fiber", "color": "blue", "fiber_count": 144, "subtype": "co_panel", "a_port_id": 1, "z_port_id": None, "a_description": "CO-Fiber-Panel-01 COF-001", "z_description": "OSP", "length": None, "strand": "49"},
+        {
+            "cable_id": "CBL-001",
+            "cable_type": "fiber",
+            "color": "blue",
+            "fiber_count": 144,
+            "subtype": "co_panel",
+            "a_port_id": 1,
+            "z_port_id": None,
+            "a_description": "CO-Fiber-Panel-01 COF-001",
+            "z_description": "OSP",
+            "length": None,
+            "strand": "49",
+            "site_id": 1,
+            "site_name": "Houlton-Maine-DC1",
+            "project": "",
+            "location": "",
+        },
     ])
 
     st.session_state.circuits = pd.DataFrame(columns=[
@@ -39,6 +55,10 @@ def initialize_data():
 
     st.session_state.tap_records = pd.DataFrame(columns=[
         "tap", "tap_port", "cable", "customer", "co_fiber", "pole", "street", "circuit_id", "status", "project", "location"
+    ])
+
+    st.session_state.change_log = pd.DataFrame(columns=[
+        "timestamp", "event_type", "entity", "entity_id", "details",
     ])
 
     st.session_state.initialized = True
