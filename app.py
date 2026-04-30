@@ -395,6 +395,51 @@ def equipment_utilization_df():
     return pd.DataFrame(rows)
 
 
+
+
+def data_quality_report():
+    """Basic consistency checks to highlight mapping issues."""
+    findings = []
+
+    def add(check, severity, count, details):
+        findings.append({
+            "Check": check,
+            "Severity": severity,
+            "Count": int(count),
+            "Details": details,
+        })
+
+    cable_ids = st.session_state.cables["cable_id"].astype(str) if "cable_id" in st.session_state.cables.columns else pd.Series(dtype=str)
+    circuit_ids = st.session_state.circuits["circuit_id"].astype(str) if "circuit_id" in st.session_state.circuits.columns else pd.Series(dtype=str)
+
+    dup_cables = cable_ids[cable_ids.duplicated()]
+    add("Duplicate cable IDs", "high" if not dup_cables.empty else "ok", len(dup_cables), ", ".join(sorted(set(dup_cables.tolist()))) if not dup_cables.empty else "None")
+
+    dup_circuits = circuit_ids[circuit_ids.duplicated()]
+    add("Duplicate circuit IDs", "high" if not dup_circuits.empty else "ok", len(dup_circuits), ", ".join(sorted(set(dup_circuits.tolist()))) if not dup_circuits.empty else "None")
+
+    known_ports = set(st.session_state.ports.get("port_id", pd.Series(dtype=int)).dropna().astype(int).tolist())
+    bad_endpoint_rows = []
+    for _, cable in st.session_state.cables.iterrows():
+        for side in ("a_port_id", "z_port_id"):
+            pid = cable.get(side)
+            if pid in (None, "") or pd.isna(pid):
+                continue
+            if int(pid) not in known_ports:
+                bad_endpoint_rows.append(f"{cable.get('cable_id')}:{side}={int(pid)}")
+    add("Cables referencing unknown ports", "high" if bad_endpoint_rows else "ok", len(bad_endpoint_rows), "; ".join(bad_endpoint_rows[:20]) if bad_endpoint_rows else "None")
+
+    all_cable_ids = set(cable_ids.tolist())
+    missing_cable_refs = []
+    for _, circuit in st.session_state.circuits.iterrows():
+        cid = circuit.get("circuit_id")
+        for linked in safe_list(circuit.get("cable_ids", [])):
+            if str(linked) not in all_cable_ids:
+                missing_cable_refs.append(f"{cid}:{linked}")
+    add("Circuits with missing cable references", "medium" if missing_cable_refs else "ok", len(missing_cable_refs), "; ".join(missing_cable_refs[:20]) if missing_cable_refs else "None")
+
+    return pd.DataFrame(findings)
+
 def add_ports_for_device(device_id, port_count, port_prefix, port_type, side="front"):
     rows = []
     start = next_int_id(st.session_state.ports, "port_id")
@@ -408,6 +453,15 @@ def add_ports_for_device(device_id, port_count, port_prefix, port_type, side="fr
         })
     if rows:
         st.session_state.ports = pd.concat([st.session_state.ports, pd.DataFrame(rows)], ignore_index=True)
+
+
+def gpon_role_defaults(role):
+    role = str(role or "")
+    if role == "gpon_splitter_1x32":
+        return {"port_count": 33, "port_type": "LC", "prefix": "SP"}
+    if role == "gpon_olt":
+        return {"port_count": 16, "port_type": "SFP+", "prefix": "PON"}
+    return None
 
 
 def init_data():
@@ -560,13 +614,19 @@ elif page == "Equipment & Ports":
             rack_options = st.session_state.racks[st.session_state.racks["site_id"] == site_id]
             rack_id = st.selectbox("Rack", rack_options["rack_id"], format_func=lambda x: get_row("racks", "rack_id", x)["name"]) if not rack_options.empty else None
             name = st.text_input("Name", placeholder="ODF-02 / Customer-Patch-Panel-01 / Core-Switch-01")
-            role = st.selectbox("Type", ["fiber_patch_panel", "ethernet_patch_panel", "switch", "router", "firewall", "customer_equipment", "carrier_demarc", "other"])
+            role = st.selectbox("Type", ["fiber_patch_panel", "gpon_splitter_1x32", "gpon_olt", "ethernet_patch_panel", "switch", "router", "firewall", "customer_equipment", "carrier_demarc", "other"])
             c1, c2, c3 = st.columns(3)
             position = c1.number_input("Start U", min_value=1, max_value=52, value=1)
-            u_height = c2.number_input("Height in U", min_value=1, max_value=20, value=1)
-            port_count = c3.number_input("Port Count", min_value=0, max_value=576, value=24)
-            port_type = st.selectbox("Port Type", ["LC", "SC", "RJ45", "SFP+", "QSFP", "Other"])
-            prefix = st.text_input("Port Prefix", value="LC-" if "fiber" in role else "Gi1/0/")
+            default_cfg = gpon_role_defaults(role)
+            default_port_count = int(default_cfg["port_count"]) if default_cfg else 24
+            default_port_type = default_cfg["port_type"] if default_cfg else "LC"
+            default_prefix = default_cfg["prefix"] if default_cfg else ("LC-" if "fiber" in role else "Gi1/0/")
+            u_height = c2.number_input("Height in U", min_value=1, max_value=20, value=2 if role == "gpon_splitter_1x32" else 1)
+            port_count = c3.number_input("Port Count", min_value=0, max_value=576, value=default_port_count)
+            port_type = st.selectbox("Port Type", ["LC", "SC", "RJ45", "SFP+", "QSFP", "Other"], index=["LC", "SC", "RJ45", "SFP+", "QSFP", "Other"].index(default_port_type) if default_port_type in ["LC", "SC", "RJ45", "SFP+", "QSFP", "Other"] else 0)
+            prefix = st.text_input("Port Prefix", value=default_prefix)
+            if role == "gpon_splitter_1x32":
+                st.caption("Recommended splitter mapping: SP01 = input (feeder), SP02–SP33 = 32 subscriber outputs.")
             submitted = st.form_submit_button("Add Equipment", type="primary")
             if submitted:
                 if not rack_id or not name:
@@ -632,7 +692,7 @@ elif page == "Connection Builder":
         with st.form("create_cable_segment"):
             col1, col2, col3 = st.columns(3)
             cable_id = col1.text_input("Cable ID", value=f"CBL-{next_int_id(st.session_state.cables, 'index') if 'index' in st.session_state.cables.columns else len(st.session_state.cables)+1:04d}")
-            cable_type = col2.selectbox("Cable Type", ["incoming_fiber", "fiber_patch", "ethernet_patch", "cross_connect", "carrier_handoff", "customer_handoff", "other"])
+            cable_type = col2.selectbox("Cable Type", ["gpon_feeder", "gpon_distribution", "incoming_fiber", "fiber_patch", "ethernet_patch", "cross_connect", "carrier_handoff", "customer_handoff", "other"])
             color = col3.selectbox("Color", ["yellow", "blue", "orange", "aqua", "green", "white", "black", "other"])
             col4, col5, col6 = st.columns(3)
             strand = col4.text_input("Fiber / Pair / Strand", placeholder="F01, Blue tube/F12, Pair 1, etc.")
@@ -654,7 +714,7 @@ elif page == "Connection Builder":
                 cA, cB, cC, cD = st.columns(4)
                 new_circuit_id = cA.text_input("Circuit ID / Service ID")
                 carrier_customer = cB.text_input("Carrier / Customer")
-                service_type = cC.selectbox("Service Type", ["DIA", "Transit", "Cross-Connect", "Wavelength", "MPLS", "Customer FTTH", "Internal", "Other"])
+                service_type = cC.selectbox("Service Type", ["GPON", "DIA", "Transit", "Cross-Connect", "Wavelength", "MPLS", "Customer FTTH", "Internal", "Other"])
                 bandwidth = cD.text_input("Bandwidth", placeholder="10G")
                 status = st.selectbox("Status", ["active", "pending", "reserved", "decommissioned", "documented"])
             submit = st.form_submit_button("Create Physical Connection", type="primary")
@@ -732,7 +792,7 @@ elif page == "Circuits":
             site_id = st.selectbox("Site", st.session_state.sites["site_id"], format_func=lambda x: get_row("sites", "site_id", x)["name"], key="circuit_site")
             project_location = st.text_input("Project / Location")
             carrier_customer = st.text_input("Carrier / Customer")
-            service_type = st.selectbox("Service Type", ["DIA", "Transit", "Cross-Connect", "Wavelength", "MPLS", "Customer FTTH", "Internal", "Other"])
+            service_type = st.selectbox("Service Type", ["GPON", "DIA", "Transit", "Cross-Connect", "Wavelength", "MPLS", "Customer FTTH", "Internal", "Other"])
             bandwidth = st.text_input("Bandwidth")
             status = st.selectbox("Status", ["active", "pending", "reserved", "decommissioned"])
             cable_ids = st.multiselect("Physical cable segments used by this circuit", st.session_state.cables["cable_id"].astype(str).tolist())
@@ -929,7 +989,7 @@ elif page == "Patchmanager View":
             with st.form("pm_quick_connect"):
                 default_cable = f"PATCH-{len(st.session_state.cables)+1:04d}"
                 cable_id = st.text_input("Cable ID", value=default_cable)
-                cable_type = st.selectbox("Cable Type", ["fiber_patch", "ethernet_patch", "incoming_fiber", "cross_connect", "carrier_handoff", "customer_handoff", "other"], key="pm_cable_type")
+                cable_type = st.selectbox("Cable Type", ["gpon_feeder", "gpon_distribution", "fiber_patch", "ethernet_patch", "incoming_fiber", "cross_connect", "carrier_handoff", "customer_handoff", "other"], key="pm_cable_type")
                 project_location = st.text_input("Project / Location", key="pm_project")
                 circuit_mode = st.radio("Circuit", ["Auto-create circuit", "Add to existing circuit", "Create named circuit"], key="pm_circuit_mode")
                 existing_circuit = None
@@ -1014,6 +1074,16 @@ elif page == "Reports":
     st.subheader("Circuit Inventory")
     st.dataframe(st.session_state.circuits, use_container_width=True, hide_index=True)
     st.download_button("Download Circuit Inventory CSV", st.session_state.circuits.to_csv(index=False), file_name="circuit_inventory.csv", mime="text/csv")
+
+    st.subheader("Data Quality Checks")
+    quality = data_quality_report()
+    st.dataframe(quality, use_container_width=True, hide_index=True)
+    issues = quality[quality["Severity"].isin(["high", "medium"])]["Count"].sum()
+    if issues:
+        st.warning(f"Found {int(issues)} issue(s). Review the checks before exporting or sharing inventory data.")
+    else:
+        st.success("No data quality issues detected in the basic consistency checks.")
+    st.download_button("Download Data Quality Report CSV", quality.to_csv(index=False), file_name="data_quality_report.csv", mime="text/csv")
 
 # -----------------------------
 # Import TAP Sheet
