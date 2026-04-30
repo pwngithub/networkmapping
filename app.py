@@ -486,7 +486,6 @@ def normalize_import_columns(df: pd.DataFrame):
 
 
 
-main
 def init_data():
     if st.session_state.get("initialized"):
         return
