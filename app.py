@@ -464,6 +464,30 @@ def gpon_role_defaults(role):
     return None
 
 
+codex/add-enhancements-to-improve-code-n052q2
+def normalize_import_columns(df: pd.DataFrame):
+    """Map common TAP spreadsheet header variants to canonical column names."""
+    alias_map = {
+        "Tap": ["tap", "tap id", "tap_name"],
+        "PORT": ["port", "tap port", "port #", "port number", "tap_port"],
+        "Cable": ["cable", "cable id", "cableid", "drop cable"],
+        "Customer": ["customer", "customer name", "subscriber", "account"],
+        "CO Fiber": ["co fiber", "co_fiber", "cofiber", "fiber", "co strand"],
+        "Pole": ["pole", "pole #", "pole number", "pole_no"],
+        "Street": ["street", "road", "address", "location street"],
+    }
+    normalized = {str(c).strip().lower(): c for c in df.columns}
+    rename = {}
+    for canonical, aliases in alias_map.items():
+        for alias in aliases:
+            if alias in normalized:
+                rename[normalized[alias]] = canonical
+                break
+    return df.rename(columns=rename)
+
+
+
+main
 def init_data():
     if st.session_state.get("initialized"):
         return
@@ -1101,7 +1125,7 @@ elif page == "Import TAP Sheet":
         site_id = None
     project_location = st.text_input("Project / Location Name", placeholder="Example: Oakfield TAP Import")
     if uploaded:
-        df = pd.read_excel(uploaded)
+        df = normalize_import_columns(pd.read_excel(uploaded))
         st.subheader("Preview")
         st.dataframe(df.head(25), use_container_width=True, hide_index=True)
         if st.button("Import TAP Records", type="primary"):
@@ -1115,6 +1139,7 @@ elif page == "Import TAP Sheet":
             missing = [c for c in required if c not in df.columns]
             if missing:
                 st.error(f"Missing required columns: {missing}")
+                st.caption(f"Detected columns: {', '.join(map(str, df.columns.tolist()))}")
             else:
                 rows = []
                 circuits = []
