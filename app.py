@@ -464,6 +464,7 @@ def gpon_role_defaults(role):
     return None
 
 
+codex/add-enhancements-to-improve-code-n052q2
 def normalize_import_columns(df: pd.DataFrame):
     """Map common TAP spreadsheet header variants to canonical column names."""
     alias_map = {
@@ -485,6 +486,8 @@ def normalize_import_columns(df: pd.DataFrame):
     return df.rename(columns=rename)
 
 
+
+main
 def init_data():
     if st.session_state.get("initialized"):
         return
