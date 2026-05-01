@@ -1,11 +1,52 @@
 import ast
 from collections import deque
 from datetime import datetime
+import sqlite3
+import json
 
 import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Colo Connection Tracker", layout="wide", page_icon="🖧")
+
+DB_PATH = "circuits.db"
+
+def _ensure_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS circuits (
+                circuit_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+
+def save_circuits_to_db():
+    _ensure_db()
+    rows = st.session_state.circuits.to_dict(orient="records")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM circuits")
+        for row in rows:
+            cid = str(row.get("circuit_id", "")).strip()
+            if not cid:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO circuits (circuit_id, payload_json, updated_at) VALUES (?, ?, ?)",
+                (cid, json.dumps(row, default=str), datetime.utcnow().isoformat()),
+            )
+
+
+def load_circuits_from_db() -> int:
+    _ensure_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        data = conn.execute("SELECT payload_json FROM circuits ORDER BY circuit_id").fetchall()
+    if not data:
+        return 0
+    rows = [json.loads(item[0]) for item in data]
+    st.session_state.circuits = pd.DataFrame(rows)
+    return len(rows)
+
 
 # -----------------------------
 # Styling
@@ -517,6 +558,21 @@ def init_data():
 
 
 init_data()
+loaded_count = load_circuits_from_db()
+if loaded_count:
+    st.caption(f"Loaded {loaded_count} circuit(s) from {DB_PATH}.")
+
+with st.sidebar.expander("Circuit Database", expanded=False):
+    st.caption("Persist circuits to local SQLite storage.")
+    if st.button("Save circuits", use_container_width=True):
+        save_circuits_to_db()
+        st.success(f"Saved {len(st.session_state.circuits)} circuit(s) to {DB_PATH}.")
+    if st.button("Reload circuits", use_container_width=True):
+        count = load_circuits_from_db()
+        if count:
+            st.success(f"Loaded {count} circuit(s) from {DB_PATH}.")
+        else:
+            st.warning("No circuits found in database yet.")
 
 st.markdown('<div class="main-title">🖧 Colo Connection Tracker</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtle">Track incoming cables, patch panels, patch cables, equipment ports, and the circuits/services riding over them.</div>', unsafe_allow_html=True)
